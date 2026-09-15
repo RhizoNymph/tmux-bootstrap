@@ -1,0 +1,30 @@
+# Example config for tmux-bootstrap.
+# Default location: ${XDG_CONFIG_HOME:-~/.config}/tmux-bootstrap/sessions.toml
+
+# A simple session: one window, one startup command.
+[sessions.notes]
+dir = "~/notes"
+cmd = "nvim"
+
+# A session with named windows. Each window may override the session dir
+# and run its own startup command. `cmd` and `windows` are mutually
+# exclusive at the session level.
+[sessions.api]
+dir = "~/Code/api"
+
+[[sessions.api.windows]]
+name = "editor"
+cmd = "nvim"
+
+[[sessions.api.windows]]
+name = "server"
+cmd = "make dev"
+
+[[sessions.api.windows]]
+name = "logs"
+dir = "~/Code/api/logs"
+cmd = "tail -f dev.log"
+
+# A bare session: just a shell in the right directory.
+[sessions.scratch]
+dir = "~"
