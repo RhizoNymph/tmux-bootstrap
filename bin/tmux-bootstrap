@@ -1,0 +1,284 @@
+#!/usr/bin/env bash
+#
+# tmux-bootstrap: create tmux sessions declared in a TOML config file.
+#
+# Each configured session gets a start directory and either a single startup
+# command or a list of named windows, each with its own optional dir and
+# command. Sessions that already exist are skipped, so re-running is safe.
+#
+# Dependencies: tmux, yq (mikefarah v4+, for TOML -> JSON), jq.
+
+set -euo pipefail
+
+readonly VERSION="0.1.0"
+
+# Exit codes: structured error classes.
+readonly E_USAGE=1   # bad CLI invocation
+readonly E_CONFIG=2  # missing/invalid config, unknown session, bad dir
+readonly E_DEPS=3    # required tool missing
+
+DEFAULT_CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/tmux-bootstrap/sessions.toml"
+
+CONFIG_JSON=""
+dry_run=0
+created=0
+skipped=0
+
+log() {
+  local level=$1 msg=$2
+  shift 2
+  local line="level=$level msg=\"$msg\""
+  local kv
+  for kv in "$@"; do
+    line+=" $kv"
+  done
+  printf '%s\n' "$line" >&2
+}
+
+die() {
+  local code=$1 msg=$2
+  shift 2
+  log error "$msg" "$@"
+  exit "$code"
+}
+
+usage() {
+  cat <<EOF
+tmux-bootstrap $VERSION — start tmux sessions declared in a TOML file
+
+Usage: tmux-bootstrap [options] [session...]
+
+With no session arguments, every session in the config is processed.
+Sessions that already exist in tmux are skipped.
+
+Options:
+  -c, --config FILE   config file (default: $DEFAULT_CONFIG)
+  -l, --list          list session names defined in the config and exit
+  -n, --dry-run       show what would be created without touching tmux
+  -h, --help          show this help
+  -V, --version       show version
+
+Config format:
+  [sessions.api]
+  dir = "~/Code/api"        # start directory (default "~")
+  cmd = "make dev"          # optional; only when no windows are defined
+
+  [[sessions.api.windows]]  # optional named windows instead of cmd
+  name = "editor"           # optional window name
+  dir = "~/Code/api/src"    # optional; defaults to the session dir
+  cmd = "nvim"              # optional startup command
+EOF
+}
+
+# All tmux calls go through this wrapper so tests can point the script at an
+# isolated server via TMUX_BOOTSTRAP_SOCKET.
+tmx() {
+  if [[ -n "${TMUX_BOOTSTRAP_SOCKET:-}" ]]; then
+    command tmux -L "$TMUX_BOOTSTRAP_SOCKET" "$@"
+  else
+    command tmux "$@"
+  fi
+}
+
+check_deps() {
+  local tool
+  for tool in tmux yq jq; do
+    command -v "$tool" >/dev/null 2>&1 || die "$E_DEPS" "required tool not found" "tool=$tool"
+  done
+}
+
+expand_tilde() {
+  case $1 in
+    "~") printf '%s\n' "$HOME" ;;
+    "~/"*) printf '%s\n' "$HOME/${1#"~/"}" ;;
+    *) printf '%s\n' "$1" ;;
+  esac
+}
+
+load_config() {
+  local path=$1
+  [[ -f "$path" ]] || die "$E_CONFIG" "config file not found" "path=$path"
+  if ! CONFIG_JSON=$(yq -p toml -o json '.' "$path"); then
+    die "$E_CONFIG" "config is not valid TOML" "path=$path"
+  fi
+  jq -e '.sessions | type == "object" and length > 0' <<<"$CONFIG_JSON" >/dev/null 2>&1 ||
+    die "$E_CONFIG" "config must define at least one [sessions.<name>] table" "path=$path"
+}
+
+validate_session() {
+  local name=$1
+  case $name in
+    *[:.]*) die "$E_CONFIG" "session name contains a character tmux reserves (: or .)" "session=$name" ;;
+  esac
+  jq -e --arg n "$name" '
+    .sessions[$n]
+    | type == "object"
+      and ((.dir // "") | type == "string")
+      and ((.cmd // "") | type == "string")
+      and ((.windows // []) | type == "array" and all(.[];
+            type == "object"
+            and ((.name // "") | type == "string")
+            and ((.dir // "") | type == "string")
+            and ((.cmd // "") | type == "string")))
+  ' <<<"$CONFIG_JSON" >/dev/null ||
+    die "$E_CONFIG" "invalid session definition" "session=$name"
+  if jq -e --arg n "$name" \
+    '.sessions[$n] | has("cmd") and ((.windows // []) | length > 0)' <<<"$CONFIG_JSON" >/dev/null; then
+    die "$E_CONFIG" "session sets both cmd and windows; use a window cmd instead" "session=$name"
+  fi
+}
+
+resolve_dir() {
+  local name=$1 raw=$2 dir
+  dir=$(expand_tilde "$raw")
+  [[ -d "$dir" ]] || die "$E_CONFIG" "directory does not exist" "session=$name" "dir=$dir"
+  printf '%s\n' "$dir"
+}
+
+create_session() {
+  local name=$1
+  if tmx has-session -t "=$name" 2>/dev/null; then
+    log info "session exists, skipping" "session=$name"
+    skipped=$((skipped + 1))
+    return 0
+  fi
+
+  local sdir
+  sdir=$(jq -r --arg n "$name" '.sessions[$n].dir // "~"' <<<"$CONFIG_JSON")
+  sdir=$(resolve_dir "$name" "$sdir")
+
+  local wcount
+  wcount=$(jq -r --arg n "$name" '.sessions[$n].windows // [] | length' <<<"$CONFIG_JSON")
+
+  if ((wcount == 0)); then
+    local cmd
+    cmd=$(jq -r --arg n "$name" '.sessions[$n].cmd // ""' <<<"$CONFIG_JSON")
+    if ((dry_run)); then
+      log info "would create session" "session=$name" "dir=$sdir" "cmd=\"$cmd\""
+      return 0
+    fi
+    local pane
+    pane=$(tmx new-session -d -s "$name" -c "$sdir" -P -F '#{pane_id}')
+    if [[ -n "$cmd" ]]; then
+      tmx send-keys -t "$pane" "$cmd" C-m
+    fi
+    log info "created session" "session=$name" "dir=$sdir" "windows=1"
+    created=$((created + 1))
+    return 0
+  fi
+
+  local i wname wdir wcmd pane
+  for ((i = 0; i < wcount; i++)); do
+    wname=$(jq -r --arg n "$name" --argjson i "$i" '.sessions[$n].windows[$i].name // ""' <<<"$CONFIG_JSON")
+    wdir=$(jq -r --arg n "$name" --argjson i "$i" '.sessions[$n].windows[$i].dir // ""' <<<"$CONFIG_JSON")
+    wcmd=$(jq -r --arg n "$name" --argjson i "$i" '.sessions[$n].windows[$i].cmd // ""' <<<"$CONFIG_JSON")
+    if [[ -n "$wdir" ]]; then
+      wdir=$(resolve_dir "$name" "$wdir")
+    else
+      wdir=$sdir
+    fi
+
+    if ((dry_run)); then
+      log info "would create window" "session=$name" "window=${wname:-<auto>}" "dir=$wdir" "cmd=\"$wcmd\""
+      continue
+    fi
+
+    local -a args
+    if ((i == 0)); then
+      args=(new-session -d -s "$name" -c "$wdir")
+    else
+      args=(new-window -d -t "=$name" -c "$wdir")
+    fi
+    if [[ -n "$wname" ]]; then
+      args+=(-n "$wname")
+    fi
+    pane=$(tmx "${args[@]}" -P -F '#{pane_id}')
+    if [[ -n "$wcmd" ]]; then
+      tmx send-keys -t "$pane" "$wcmd" C-m
+    fi
+  done
+
+  if ((!dry_run)); then
+    log info "created session" "session=$name" "dir=$sdir" "windows=$wcount"
+    created=$((created + 1))
+  fi
+}
+
+main() {
+  local config=$DEFAULT_CONFIG
+  local list_only=0
+  local -a selected=()
+
+  while (($#)); do
+    case $1 in
+      -c | --config)
+        [[ $# -ge 2 ]] || die "$E_USAGE" "option requires a value" "option=$1"
+        config=$2
+        shift 2
+        ;;
+      -n | --dry-run)
+        dry_run=1
+        shift
+        ;;
+      -l | --list)
+        list_only=1
+        shift
+        ;;
+      -h | --help)
+        usage
+        exit 0
+        ;;
+      -V | --version)
+        echo "tmux-bootstrap $VERSION"
+        exit 0
+        ;;
+      --)
+        shift
+        selected+=("$@")
+        break
+        ;;
+      -*)
+        die "$E_USAGE" "unknown option" "option=$1"
+        ;;
+      *)
+        selected+=("$1")
+        shift
+        ;;
+    esac
+  done
+
+  check_deps
+  load_config "$config"
+
+  local -a all=()
+  mapfile -t all < <(jq -r '.sessions | keys[]' <<<"$CONFIG_JSON")
+
+  if ((list_only)); then
+    printf '%s\n' "${all[@]}"
+    exit 0
+  fi
+
+  local name
+  for name in "${all[@]}"; do
+    validate_session "$name"
+  done
+
+  local -a targets=()
+  if ((${#selected[@]} == 0)); then
+    targets=("${all[@]}")
+  else
+    for name in "${selected[@]}"; do
+      jq -e --arg n "$name" '.sessions | has($n)' <<<"$CONFIG_JSON" >/dev/null ||
+        die "$E_CONFIG" "session not defined in config" "session=$name" "config=$config"
+      targets+=("$name")
+    done
+  fi
+
+  for name in "${targets[@]}"; do
+    create_session "$name"
+  done
+
+  log info "done" "created=$created" "skipped=$skipped" "dry_run=$dry_run"
+}
+
+main "$@"
