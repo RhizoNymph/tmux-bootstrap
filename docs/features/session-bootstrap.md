@@ -19,6 +19,10 @@
 
 ## Data / control flow
 
+0. Source guard: before anything else (and before `set -e`), the script
+   compares `BASH_SOURCE[0]` to `$0`. If they differ it was sourced, so it
+   logs an error and `return`s 1 without defining or changing anything in
+   the caller. This protects rc files from the `exit`/`set -e` below.
 1. `main` parses CLI args (`-c/--config`, `-n/--dry-run`, `-l/--list`,
    `-h`, `-V`, positional session names), then `check_deps` verifies
    `tmux`, `yq`, `jq` exist (exit 3 if not).
@@ -53,7 +57,7 @@ Commands are injected with `send-keys` into the pane's interactive shell
   (structured stderr logging, typed exit codes 1=usage 2=config 3=deps),
   `tmx` (tmux wrapper honoring `TMUX_BOOTSTRAP_SOCKET`), `load_config`,
   `validate_session`, `expand_tilde`, `resolve_dir`, `create_session`, `main`.
-- `tests/run_tests.sh` — 13 black-box tests; each runs against a private
+- `tests/run_tests.sh` — 14 black-box tests; each runs against a private
   tmux server (`tmux -L tbtest-$$`) created in `setup` and killed in
   `teardown`, with configs generated in a per-test `mktemp -d`.
 - `examples/sessions.toml` — annotated example config.
@@ -69,5 +73,10 @@ Commands are injected with `send-keys` into the pane's interactive shell
   is unset; tests must always set it.
 - `yq` must be mikefarah v4+ (`-p toml`); python-yq's CLI is incompatible.
 - Exit codes are stable API: 0 ok, 1 usage, 2 config, 3 missing dependency.
+- The script must be executed, never sourced. Sourcing returns 1 (usage)
+  and leaves the calling shell's options untouched; `set -euo pipefail` is
+  only reached on the executed path. Recommended rc-file integration (guard
+  on `$TMUX`, run as a background child with a timeout) is documented in the
+  README's Shell integration section.
 - stdout is reserved for machine-readable output (`--list`); all logs go to
   stderr as `level=... msg="..." key=value` pairs.

@@ -7,7 +7,8 @@ Overview:
     named tmux sessions (start directory, optional named windows, startup
     commands) and creates any that are not already running.
   subsystems:
-    - cli (bin/tmux-bootstrap): argument parsing, dependency checks, logging
+    - cli (bin/tmux-bootstrap): source guard, argument parsing, dependency
+      checks, logging
     - config: TOML -> JSON via yq, schema validation via jq
     - tmux-driver: session/window creation and command injection via tmux,
       isolated behind a wrapper that honors TMUX_BOOTSTRAP_SOCKET
