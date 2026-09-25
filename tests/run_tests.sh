@@ -241,6 +241,18 @@ EOF
   assert_rc 2 $? "nonexistent session dir"
 }
 
+test_refuses_to_be_sourced() {
+  # Sourcing (e.g. from ~/.bashrc) must not exit the caller or leak set -e/-u.
+  local out
+  out=$(bash -c '. "$1"; echo "rc=$? opts=$-"' _ "$SCRIPT" 2>/dev/null)
+  [[ "$out" == rc=1\ opts=* ]] || { echo "sourcing did not return 1 or killed the shell: '$out'"; return 1; }
+  local opts=${out#*opts=}
+  [[ "$opts" != *e* && "$opts" != *u* ]] || { echo "set -e/-u leaked into sourcing shell: opts=$opts"; return 1; }
+  local err
+  err=$(bash -c '. "$1"' _ "$SCRIPT" 2>&1 >/dev/null)
+  [[ "$err" == *"must be executed, not sourced"* ]] || { echo "missing sourced-error message: '$err'"; return 1; }
+}
+
 # --- runner ------------------------------------------------------------------
 
 run_test test_missing_config
@@ -256,6 +268,7 @@ run_test test_cmd_and_windows_conflict
 run_test test_invalid_session_name
 run_test test_list
 run_test test_missing_dir
+run_test test_refuses_to_be_sourced
 
 echo
 echo "passed=$PASS failed=$FAIL"

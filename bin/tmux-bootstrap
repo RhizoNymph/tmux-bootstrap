@@ -8,6 +8,14 @@
 #
 # Dependencies: tmux, yq (mikefarah v4+, for TOML -> JSON), jq.
 
+# Refuse to be sourced. This script calls exit and enables set -euo pipefail;
+# sourced from a shell rc file, either would kill or cripple the login shell.
+# Placed before set -e so nothing below leaks into a sourcing shell.
+if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
+  printf 'level=error msg="tmux-bootstrap must be executed, not sourced" hint="see README: Shell integration"\n' >&2
+  return 1  # E_USAGE; constants are not defined yet at this point
+fi
+
 set -euo pipefail
 
 readonly VERSION="0.1.0"
